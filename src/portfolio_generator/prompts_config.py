@@ -226,7 +226,7 @@ Orasis Capital is a hedge fund with a 20-year track record in shipping investmen
   * Confidence level (high/moderate/low) with justification
   * Data-backed rationale with specific numbers/trends
   * Relation to prior portfolio positions (if applicable)
-- MUST include a clear, concise summary table in the Executive Summary showing all 10-15 positions with columns for:
+- MUST include a clear, concise summary table in the Executive Summary showing all 20-25 positions with columns for:
   * Asset/Ticker
   * Position Type (Long/Short)
   * Allocation %

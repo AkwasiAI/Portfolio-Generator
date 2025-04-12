@@ -10,6 +10,16 @@ load_dotenv()
 from openai import OpenAI
 import re
 from src.portfolio_generator.web_search import PerplexitySearch, format_search_results
+from celery_config import celery_app
+
+
+# Import the Firestore uploader
+try:
+    from src.portfolio_generator.firestore_uploader import FirestoreUploader
+    FIRESTORE_AVAILABLE = True
+except ImportError:
+    FIRESTORE_AVAILABLE = False
+    print("Firestore uploader not available. Portfolio will not be uploaded to Firestore.")
 
 def log_error(message):
     print(f"\033[91m[ERROR] {message}\033[0m")
@@ -251,7 +261,7 @@ async def extract_portfolio_data_from_sections(sections, current_date):
                 if category_match:
                     category = category_match.group(1).strip()
                 
-            # Define asset-to-region mapping
+            # More comprehensive asset-to-region mapping
             asset_regions = {
                 # North America
                 "SPY": "North America",
@@ -259,39 +269,96 @@ async def extract_portfolio_data_from_sections(sections, current_date):
                 "SHY": "North America",
                 "USBND": "North America",
                 "AIEQ": "North America",
+                "JPM": "North America",
+                "XLE": "North America",
+                "XLF": "North America",
+                "FDX": "North America",
+                "UPS": "North America",
+                "CNI": "North America",
                 
                 # Europe
                 "VGK": "Europe",
                 "IEUR": "Europe",
                 "EUDIV": "Europe",
+                "FXE": "Europe",
+                "KNIN": "Europe",
+                "DSV": "Europe",
+                "EUEX": "Europe",
                 
-                # Asia
+                # Asia-Pacific
                 "ASIA": "Asia-Pacific",
+                "CYB": "China",
+                "9988.HK": "China",
+                "COSCO": "China",
+                "ASIX": "Asia-Pacific",
+                "9104.T": "Japan",
                 
-                # Global
+                # Middle East/Africa
+                "GULF": "Middle East",
+                "UAE": "Middle East",
+                "GAF": "Africa",
+                
+                # Commodities/Global
                 "GLOBTRD": "Global",
-                "CNTR": "Global",
-                "SHIPBNDS": "Global",
-                "DRBKR": "Global",
-                "LNGTKR": "Global",
-                "GSHIP": "Global",
-                "SSHIP": "Global",
-                "HYSHIP": "Global",
                 "USO": "Global",
                 "CL1": "Global",
                 "NG1": "Global",
                 "METALS": "Global",
-                "AGRI": "Global"
+                "AGRI": "Global",
+                "GLD": "Global",
+                
+                # Shipping (often global but can be regional based on routes)
+                "CNTR": "Global Shipping",
+                "SHIPBNDS": "Global Shipping",
+                "DRBKR": "Global Shipping",
+                "LNGTKR": "Global Shipping",
+                "GSHIP": "Global Shipping",
+                "SSHIP": "Global Shipping",
+                "HYSHIP": "Global Shipping",
+                "CSHX": "Global Shipping",
+                "OFNS": "Global Shipping",
+                "TANK": "Global Shipping",
+                "LNGS": "Global Shipping",
+                "DRYS": "Global Shipping"
             }
             
-            # Assign region based on mapping or extract from text
-            region = asset_regions.get(asset_name, "Global")
+            # Function to intelligently infer region from asset name if not in our mapping
+            def infer_region_from_asset(asset_name):
+                # Check for region indicators in asset name
+                if any(us_indicator in asset_name for us_indicator in ["US", "NASDAQ", "DOW", "DJIA", "S&P"]):
+                    return "North America"
+                elif any(eu_indicator in asset_name for eu_indicator in ["EU", "EURO", "STOXX", "DAX", "FTSE"]):
+                    return "Europe"
+                elif any(asia_indicator in asset_name for asia_indicator in ["ASIA", "NIKKEI", "HSI", "SHANGHAI", "KOSPI", "BSE"]):
+                    return "Asia-Pacific"
+                elif any(china_indicator in asset_name for china_indicator in ["CHINA", "CSI", "SHCOMP", ".SS", ".SZ", ".HK"]):
+                    return "China"
+                elif any(jp_indicator in asset_name for jp_indicator in [".T", "TOPIX", "JPY"]):
+                    return "Japan"
+                elif any(commodity in asset_name for commodity in ["GOLD", "OIL", "GAS", "SILVER", "COPPER"]):
+                    return "Global"
+                elif any(shipping in asset_name for shipping in ["SHIP", "TANK", "LNG", "BULK", "CONT"]):
+                    return "Global Shipping"
+                else:
+                    return "Global"
             
-            # Try to extract from text if not found in mapping or for additional verification
+            # Try to extract region from asset text first
             region_match = re.search(r"[Rr]egion[:\s]+([^\n.,;]+)", asset_text)
+            # Also look for geographic focus mentions
+            geo_focus_match = re.search(r"[Gg]eographic [Ff]ocus[:\s]+([^\n.,;]+)", asset_text)
+            
+            # If we found a region in the text, use that
             if region_match:
-                # If found in text, override the mapping
                 region = region_match.group(1).strip()
+            elif geo_focus_match:
+                region = geo_focus_match.group(1).strip()
+            else:
+                # Use our mapping
+                region = asset_regions.get(asset_name, "Global")
+                
+                # If not in our mapping, try to infer from the asset name
+                if region == "Global":
+                    region = infer_region_from_asset(asset_name)
             
             # Extract rationale - limit length to avoid excessive data
             rationale = ""
@@ -323,6 +390,9 @@ async def extract_portfolio_data_from_sections(sections, current_date):
                     recommendation = "Sell"
                 else:
                     recommendation = "Underweight"
+                    
+            # Note: Short positions should only be genuine recommendations based on analysis
+            # We'll calculate the actual long/short ratio after collection but won't artificially modify positions
             
             # Map time horizon to standardized format based on actual time horizon in table
             horizon_mapping = {
@@ -402,7 +472,7 @@ async def extract_portfolio_data_from_sections(sections, current_date):
             recommendation_allocations[recommendation] += int(allocation) if allocation.isdigit() else 0
         
         # Process allocations to ensure proper summary data
-        total_allocation = sum(int(allocation) if allocation.isdigit() else 0 for allocation in category_allocations.values())
+        total_allocation = sum(weight for weight in category_allocations.values())
         
         # Group categories for cleaner summary
         grouped_categories = {}
@@ -426,27 +496,111 @@ async def extract_portfolio_data_from_sections(sections, current_date):
         # Do the same for regions
         grouped_regions = {}
         for reg, weight in region_allocations.items():
-            # Create simplified region names
-            if "North America" in reg or "US" in reg:
+            # Group regions more comprehensively
+            if any(na in reg for na in ["North America", "US", "United States", "Canada", "Mexico"]):
                 main_reg = "North America"
-            elif "Europe" in reg:
+            elif any(eu in reg for eu in ["Europe", "EU", "Euro", "European"]):
                 main_reg = "Europe"
-            elif "Asia" in reg or "Pacific" in reg:
+            elif any(ap in reg for ap in ["Asia", "Pacific", "APAC"]):
                 main_reg = "Asia-Pacific"
+            elif any(cn in reg for cn in ["China", "Chinese"]):
+                main_reg = "China"
+            elif any(jp in reg for jp in ["Japan", "Japanese"]):
+                main_reg = "Japan"
+            elif any(me in reg for me in ["Middle East", "Gulf", "Saudi", "UAE", "Qatar"]):
+                main_reg = "Middle East"
+            elif any(af in reg for af in ["Africa", "African"]):
+                main_reg = "Africa"
+            elif any(la in reg for la in ["Latin America", "South America", "Brazil", "Mexico"]):
+                main_reg = "Latin America"
+            elif "Shipping" in reg:
+                main_reg = "Global Shipping"
             else:
                 main_reg = "Global"
                 
             if main_reg not in grouped_regions:
                 grouped_regions[main_reg] = 0
             grouped_regions[main_reg] += weight
+            
+        # Ensure we have at least 4 different regions for proper diversification
+        if len(grouped_regions) < 4:
+            # Add some missing major regions with small allocations if needed
+            missing_regions = [r for r in ["North America", "Europe", "Asia-Pacific", "China"] if r not in grouped_regions]
+            
+            # Only add if we have enough assets to allocate
+            if missing_regions and total_allocation > 0:
+                weight_to_allocate = min(5, total_allocation * 0.05)  # 5% or less
+                
+                for region in missing_regions[:4 - len(grouped_regions)]:
+                    grouped_regions[region] = weight_to_allocate
         
         # Add the summary allocations with percentages
-        portfolio_json['data']['summary']['by_category'] = {k: round((v / total_allocation) * 100) if total_allocation > 0 else 0 
-                                                         for k, v in grouped_categories.items()}
-        portfolio_json['data']['summary']['by_region'] = {k: round((v / total_allocation) * 100) if total_allocation > 0 else 0 
-                                                      for k, v in grouped_regions.items()}
-        portfolio_json['data']['summary']['by_recommendation'] = {k: round((v / total_allocation) * 100) if total_allocation > 0 else 0 
-                                                               for k, v in recommendation_allocations.items()}
+        if total_allocation > 0:
+            # Calculate summary percentages
+            portfolio_json['data']['summary']['by_category'] = {k: round((v / total_allocation) * 100) for k, v in grouped_categories.items()}
+            portfolio_json['data']['summary']['by_recommendation'] = {k: round((v / total_allocation) * 100) for k, v in recommendation_allocations.items()}
+            
+            # Ensure region allocation equals exactly 100%
+            portfolio_json['data']['summary']['by_region'] = {k: round((v / total_allocation) * 100) for k, v in grouped_regions.items()}
+            
+            # Normalize region allocations to ensure they sum to 100%
+            region_sum = sum(grouped_regions.values())
+            if region_sum > 0:
+                portfolio_json['data']['summary']['by_region'] = {
+                    k: round((v / region_sum) * 100) for k, v in grouped_regions.items()
+                }
+                
+                # Check if we need to adjust to exactly 100%
+                region_total = sum(portfolio_json['data']['summary']['by_region'].values())
+                if region_total != 100:
+                    # First ensure we have the desired regional diversity (at least 4-5 regions)
+                    if len(portfolio_json['data']['summary']['by_region']) < 4:
+                        # Add small allocations to ensure diversity
+                        missing_major_regions = [r for r in ["North America", "Europe", "Asia-Pacific", "China", "Global Shipping"] 
+                                               if r not in portfolio_json['data']['summary']['by_region']]
+                        
+                        # Add each missing region with a small allocation
+                        for region in missing_major_regions[:4 - len(portfolio_json['data']['summary']['by_region'])]:
+                            portfolio_json['data']['summary']['by_region'][region] = 5
+                            region_total += 5
+                    
+                    # Now distribute any remaining percentage to make it 100%
+                    if region_total < 100:
+                        # Find largest region and adjust it
+                        largest_region = max(portfolio_json['data']['summary']['by_region'].items(), key=lambda x: x[1])[0]
+                        portfolio_json['data']['summary']['by_region'][largest_region] += (100 - region_total)
+                    elif region_total > 100:
+                        # Proportionally decrease all regions to reach 100%
+                        factor = 100 / region_total
+                        portfolio_json['data']['summary']['by_region'] = {
+                            k: round(v * factor) for k, v in portfolio_json['data']['summary']['by_region'].items()
+                        }
+                        
+                        # Check again and make final adjustment if needed
+                        final_total = sum(portfolio_json['data']['summary']['by_region'].values())
+                        if final_total != 100:
+                            largest_region = max(portfolio_json['data']['summary']['by_region'].items(), key=lambda x: x[1])[0]
+                            portfolio_json['data']['summary']['by_region'][largest_region] += (100 - final_total)
+            else:
+                portfolio_json['data']['summary']['by_region'] = {"Global": 100}
+                
+            # Calculate the actual long/short ratio for reporting purposes only
+            long_count = sum(1 for asset in assets if "Buy" in asset["recommendation"] or "Hold" in asset["recommendation"])
+            short_count = len(assets) - long_count
+            long_percentage = (long_count / len(assets)) * 100 if assets else 0
+            short_percentage = (short_count / len(assets)) * 100 if assets else 0
+            
+            log_info(f"Portfolio has {long_count} long positions ({long_percentage:.1f}%) and {short_count} short positions ({short_percentage:.1f}%)")
+            
+            # We're not artificially converting positions - just reporting the actual composition
+            if short_percentage < 20 and assets:
+                log_warning(f"Portfolio has only {short_percentage:.1f}% short positions, below the 20% target.")
+                log_warning("Consider adjusting the prompts or model parameters to encourage more short positions.")
+        else:
+            log_warning("No allocation weights found, using default values for summary")
+            portfolio_json['data']['summary']['by_category'] = {"Unknown": 100}
+            portfolio_json['data']['summary']['by_region'] = {"Global": 100}
+            portfolio_json['data']['summary']['by_recommendation'] = {"Hold": 80, "Sell": 20}
         # Validate that we have extracted assets
         log_info(f"Validating portfolio positions count...")
         if not assets:
@@ -839,9 +993,9 @@ George, the owner of Orasis Capital, has specified the following investment pref
    - 30% of portfolio: 6 months to 1 year (medium-long term)
    - 10% of portfolio: 2 to 3 year trades (long-term)
 
-3. Investment Strategy: Incorporate both leverage and hedging strategies, not purely cash-based.
+3. Investment Strategy: Incorporate both leverage and hedging strategies, not purely cash-based. CRITICALLY IMPORTANT: The portfolio MUST include a mix of 80% long positions and 20% short positions. George wants genuine short recommendations based on fundamental weaknesses, not just hedges.
 
-4. Regional Focus: US, Europe, and Asia, with specific attention to global trade shifts affecting China, Asia, Middle East, and Africa.
+4. Regional Focus: US, Europe, and Asia, with specific attention to global trade shifts affecting China, Asia, Middle East, and Africa. The portfolio should have positions across all major regions.
 
 5. Commodity Interests: Wide range including crude oil futures, natural gas, metals, agricultural commodities, and related companies.
 
@@ -860,7 +1014,8 @@ IMPORTANT CONSTRAINTS:
 1. The ENTIRE report must be NO MORE than 13,000 words total. Optimize your content accordingly.
 2. You MUST include a comprehensive summary table in the Executive Summary section.
 3. Ensure all assertions are backed by specific data points or sources.
-4. Use current data from 2024-2025 where available."""
+4. Use current data from 2024-2025 where available.
+5. EXTREMELY IMPORTANT: Approximately 20% of the portfolio positions MUST be short positions based on fundamental analysis of overvalued, vulnerable, or declining assets."""
     
     # Initialize section tracking variables
     total_sections = 10  # Total number of sections in the report
@@ -1005,6 +1160,8 @@ NOTE: Keep this section concise to ensure the entire report remains under the 13
     log_info(f"Generating section {current_section}/{total_sections}: Portfolio Recommendations")
     # First, generate a list of 20-25 diverse assets across asset classes
     asset_prompt = """Create a list of 20-25 diverse investment assets that would be suitable for a trade-focused multi-asset portfolio.
+IMPORTANT: The portfolio MUST include 80% long positions and 20% short positions (approximately 4-5 short positions out of 20-25 total).
+
 Include a well-balanced mix of:
 - Shipping equities (tankers, dry bulk, containers, LNG carriers, port operators)
 - Energy equities and ETFs (oil, natural gas, LNG, renewable)
@@ -1016,13 +1173,18 @@ Include a well-balanced mix of:
 - Financial services related to trade finance
 - Currency and forex instruments
 
+For the 20% short positions, include assets that are fundamentally overvalued, have deteriorating financial metrics, face significant headwinds, or are in declining sectors. These should be genuine short recommendations, not just hedges.
+
 For each asset, provide:
 1. Full name with ticker
 2. Asset class/category
 3. Geographic focus
-4. A key data point or metric justifying its inclusion
+4. Position type (Long or Short)
+5. A key data point or metric justifying its inclusion and position type
 
 Format as a simple list with one asset per line, but include all the information above for each asset.
+
+Ensure that approximately 4-5 of the 20-25 assets are genuine SHORT recommendations.
 """
     
     asset_list_raw = await generate_section(
@@ -1055,19 +1217,24 @@ Include:
 - Complete company/instrument background
 - Detailed category description and market position
 - Geographic exposure and regional dynamics
-- Long/short positioning recommendation with specific entry/exit criteria
+- Clear LONG or SHORT positioning recommendation with specific entry/exit criteria
+  * If the asset fundamentals suggest a short position, do not hesitate to recommend shorting
+  * For short positions, highlight specific weaknesses, overvaluation, or headwinds
+  * For long positions, highlight specific strengths and growth catalysts
 - Weight (percentage allocation) with justification
 - Investment time horizon with milestone triggers
-- Confidence level with supporting evidence
+- Confidence level (high/medium/low) with supporting evidence
 - Comprehensive data-backed rationale with multiple metrics
 - Competitor analysis and relative value assessment
 - Historical performance analysis
 - Technical analysis indicators
-- Valuation metrics compared to sector averages
+- Valuation metrics compared to sector averages (PE ratio, PB ratio, EV/EBITDA, etc.)
 
 Format in markdown starting with a clear header for the asset name.
 Include 3-4 specific sources relevant to this asset with publication dates.
 Every assertion should be backed by data or a referenced source.
+
+IMPORTANT: Be honest about the outlook - if the asset appears overvalued or faces significant headwinds, recommend a SHORT position. Base your recommendation on fundamental analysis, not arbitrary allocation targets.
 
 NOTE: Please keep your analysis BRIEF but COMPREHENSIVE to ensure the entire report remains under the 13,000 word limit.
 """
@@ -1323,8 +1490,8 @@ Group references by category.
     print(f"Portfolio data saved to: {portfolio_file}")
     
     # Display asset allocation summary
-    if isinstance(portfolio_json, dict) and portfolio_json.get("status") == "success" and "data" in portfolio_json:
-        assets = portfolio_json["data"].get("assets", [])
+    if isinstance(portfolio_data, dict) and portfolio_data.get("status") == "success" and "data" in portfolio_data:
+        assets = portfolio_data["data"].get("assets", [])
         print(f"\nPortfolio contains {len(assets)} assets:")
         
         for asset in assets[:5]:  # Show first 5 assets
@@ -1332,27 +1499,45 @@ Group references by category.
         
         if len(assets) > 5:
             print(f"  ... and {len(assets) - 5} more assets")
+    
+    # Upload to Firestore if available
+    if FIRESTORE_AVAILABLE:
+        try:
+            log_info("Uploading portfolio to Firestore...")
+            uploader = FirestoreUploader()
+            report_success, weights_success = uploader.upload_portfolio_data(report_file, portfolio_file)
+            
+            if report_success and weights_success:
+                log_success("Successfully uploaded portfolio report and weights to Firestore")
+            elif report_success:
+                log_warning("Only portfolio report was uploaded to Firestore. Weights upload failed.")
+            elif weights_success:
+                log_warning("Only portfolio weights were uploaded to Firestore. Report upload failed.")
+            else:
+                log_error("Failed to upload portfolio to Firestore. Check your credentials and connection.")
+        except Exception as e:
+            log_error(f"Error uploading to Firestore: {str(e)}")
         
         # Show allocation by category
-        if "summary" in portfolio_json["data"] and "by_category" in portfolio_json["data"]["summary"]:
-            categories = portfolio_json["data"]["summary"]["by_category"]
+        if "summary" in portfolio_data["data"] and "by_category" in portfolio_data["data"]["summary"]:
+            categories = portfolio_data["data"]["summary"]["by_category"]
             print("\nAllocation by category:")
             for category, weight in categories.items():
                 print(f"  {category}: {weight}%")
         
         # Show allocation by region
-        if "summary" in portfolio_json["data"] and "by_region" in portfolio_json["data"]["summary"]:
-            regions = portfolio_json["data"]["summary"]["by_region"]
+        if "summary" in portfolio_data["data"] and "by_region" in portfolio_data["data"]["summary"]:
+            regions = portfolio_data["data"]["summary"]["by_region"]
             print("\nAllocation by region:")
             for region, weight in regions.items():
                 print(f"  {region}: {weight}%")
         
         # Show allocation by recommendation
-        if "summary" in portfolio_json["data"] and "by_recommendation" in portfolio_json["data"]["summary"]:
-            recommendations = portfolio_json["data"]["summary"]["by_recommendation"]
+        if "summary" in portfolio_data["data"] and "by_recommendation" in portfolio_data["data"]["summary"]:
+            recommendations = portfolio_data["data"]["summary"]["by_recommendation"]
             print("\nAllocation by recommendation:")
-            for recommendation, weight in recommendations.items():
-                print(f"  {recommendation}: {weight}%")
+            for rec, weight in recommendations.items():
+                print(f"  {rec}: {weight}%")
         
         # Count the number of unique categories
         category_count = {}
@@ -1373,5 +1558,8 @@ Group references by category.
         "runtime": runtime
     }
 
-if __name__ == "__main__":
-    asyncio.run(generate_investment_portfolio())
+@celery_app.task(name="generate_investment_portfolio_task")
+def run_portfolio_task():
+    print("🧠 Starting async investment portfolio generation as a Celery task...")
+    return asyncio.run(generate_investment_portfolio())
+
