@@ -218,7 +218,7 @@ Orasis Capital is a hedge fund with a 20-year track record in shipping investmen
 - Title format: "Orasis Capital Multi-Asset Portfolio – [Month Day, Year]"
 - Professional tone suitable for a Hedge Fund Investment Manager
 - Comprehensive, data-rich analysis with specific metrics and attribution of sources
-- STRICTLY LIMIT to 10-15 investment positions TOTAL (mix of long/short) with detailed rationale for each, including:
+- STRICTLY LIMIT to 20-25 investment positions TOTAL (mix of long/short) with detailed rationale for each, including:
   * Asset names/tickers
   * Long/short positioning
   * Target allocation percentages (exact weights adding to 100%)

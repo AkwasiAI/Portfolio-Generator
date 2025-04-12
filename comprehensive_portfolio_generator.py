@@ -9,9 +9,8 @@ from dotenv import load_dotenv
 load_dotenv()
 from openai import OpenAI
 import re
-from portfolio_generator.web_search import PerplexitySearch
+from src.portfolio_generator.web_search import PerplexitySearch, format_search_results
 
-# Define logging functions for better visibility
 def log_error(message):
     print(f"\033[91m[ERROR] {message}\033[0m")
     
@@ -83,6 +82,218 @@ async def generate_section(client, section_name, system_prompt, user_prompt, sea
             sys.exit(1)
         return f"## {section_name}\n\nError generating content: {e}\n\n"
 
+def save_prompts_to_file(current_date, base_system_prompt, exec_summary_prompt, global_economy_prompt,
+                      energy_markets_prompt, commodities_prompt, shipping_prompt, asset_prompt,
+                      portfolio_prompt, conclusion_prompt, references_prompt, search_queries):
+    """Save all prompts used in the report generation to a text file in the output folder."""
+    try:
+        # Ensure output directory exists
+        os.makedirs("output", exist_ok=True)
+        
+        # Create filename with current date
+        prompts_file_path = f"output/investment_portfolio_prompts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        
+        with open(prompts_file_path, "w") as f:
+            f.write(f"# Investment Portfolio Prompts - Generated on {current_date}\n\n")
+            
+            # Base system prompt
+            f.write("## Base System Prompt\n")
+            f.write(base_system_prompt)
+            f.write("\n\n" + "-"*80 + "\n\n")
+            
+            # Executive Summary prompt
+            f.write("## Executive Summary Prompt\n")
+            f.write(exec_summary_prompt)
+            f.write("\n\n" + "-"*80 + "\n\n")
+            
+            # Global Economy prompt
+            f.write("## Global Economy Prompt\n")
+            f.write(global_economy_prompt)
+            f.write("\n\n" + "-"*80 + "\n\n")
+            
+            # Energy Markets prompt
+            f.write("## Energy Markets Prompt\n")
+            f.write(energy_markets_prompt)
+            f.write("\n\n" + "-"*80 + "\n\n")
+            
+            # Commodities prompt
+            f.write("## Commodities Prompt\n")
+            f.write(commodities_prompt)
+            f.write("\n\n" + "-"*80 + "\n\n")
+            
+            # Shipping prompt
+            f.write("## Shipping Sectors Prompt\n")
+            f.write(shipping_prompt)
+            f.write("\n\n" + "-"*80 + "\n\n")
+            
+            # Asset List prompt
+            f.write("## Asset List Generation Prompt\n")
+            f.write(asset_prompt)
+            f.write("\n\n" + "-"*80 + "\n\n")
+            
+            # Portfolio Positions prompt
+            f.write("## Portfolio Positions Prompt\n")
+            f.write(portfolio_prompt)
+            f.write("\n\n" + "-"*80 + "\n\n")
+            
+            # Conclusion prompt
+            f.write("## Conclusion and Summary Prompt\n")
+            f.write(conclusion_prompt)
+            f.write("\n\n" + "-"*80 + "\n\n")
+            
+            # References prompt
+            f.write("## References Prompt\n")
+            f.write(references_prompt)
+            f.write("\n\n" + "-"*80 + "\n\n")
+            
+            # Web Search Queries
+            f.write("## Web Search Queries\n")
+            f.write("The following search queries were used to gather market data:\n\n")
+            for i, query in enumerate(search_queries, 1):
+                f.write(f"{i}. {query}\n")
+        
+        log_success(f"Saved all prompts to {prompts_file_path}")
+    except Exception as e:
+        log_error(f"Error saving prompts to file: {e}")
+
+async def extract_portfolio_data_from_sections(sections, current_date):
+    """Extract portfolio data from the generated report sections to create a structured JSON."""
+    # Create the base JSON structure that matches the expected format
+    portfolio_json = {
+        "status": "success",
+        "data": {
+            "report_date": current_date,
+            "assets": [],
+            "summary": {
+                "by_category": {},
+                "by_region": {},
+                "by_recommendation": {}
+            }
+        }
+    }
+    
+    try:
+        # Extract data from the executive summary section which has the summary table
+        exec_summary = sections.get("executive_summary", "")
+        portfolio_items = sections.get("portfolio_items", "")
+        all_sections_text = "".join(sections.values())
+        
+        # Use regex to extract the portfolio table from executive summary
+        import re
+        
+        # Extract assets from markdown table in the executive summary
+        table_pattern = r"\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|"
+        assets = []
+        category_allocations = {}
+        region_allocations = {}
+        recommendation_allocations = {}
+        
+        # First pass: gather all assets from the executive summary table
+        matches = re.findall(table_pattern, exec_summary)
+        for match in matches:
+            # Skip header rows or non-asset rows
+            if any(header in match[0].lower() for header in ["asset", "ticker", "---"]) or not match[0].strip():
+                continue
+                
+            # Process asset data
+            asset_name = match[0].strip()
+            position_type = match[1].strip()
+            allocation = match[2].strip().replace("%", "").strip()
+            time_horizon = match[3].strip()
+            confidence = match[4].strip()
+            
+            # Extract asset details from portfolio section
+            asset_info = {}
+            
+            # Look for detailed information about this asset in the entire report
+            asset_sections = re.findall(rf"{re.escape(asset_name)}[\s\S]*?(?=\n\n\d+\.|$)", all_sections_text)
+            asset_text = "\n".join(asset_sections) if asset_sections else ""
+            
+            # Extract category
+            category = "Equity"  # Default category
+            category_match = re.search(r"[Cc]ategory[:\s]+([^\n.,;]+)", asset_text)
+            if category_match:
+                category = category_match.group(1).strip()
+            
+            # Extract region
+            region = "Global"  # Default region
+            region_match = re.search(r"[Rr]egion[:\s]+([^\n.,;]+)", asset_text)
+            if region_match:
+                region = region_match.group(1).strip()
+            
+            # Extract rationale
+            rationale = ""
+            rationale_match = re.search(r"[Rr]ationale[:\s]+([^\n.]+)", asset_text)
+            if rationale_match:
+                rationale = rationale_match.group(1).strip()
+            else:
+                # If no specific rationale, try to find any sentence with the asset name
+                rationale_sentences = re.findall(rf"[^.!?]*{re.escape(asset_name)}[^.!?]*[.!?]", all_sections_text)
+                if rationale_sentences:
+                    rationale = rationale_sentences[0].strip()
+            
+            # Determine recommendation based on position type
+            recommendation = ""
+            if position_type.lower() == "long":
+                recommendation = "Buy Long"
+            elif position_type.lower() == "short":
+                recommendation = "Sell Short"
+            
+            # Standardize time horizon format
+            horizon = time_horizon
+            if "month" in time_horizon.lower() or "m" in time_horizon.lower():
+                if any(term in time_horizon.lower() for term in ["1", "2", "3", "short"]):
+                    horizon = "Short (1-3M)"
+                elif any(term in time_horizon.lower() for term in ["3", "4", "5", "6", "medium"]):
+                    horizon = "Medium (3-6M)"
+                elif any(term in time_horizon.lower() for term in ["6", "7", "8", "9", "10", "11", "12", "long"]):
+                    horizon = "Long (6-12M)"
+            
+            # Create formatted asset entry
+            asset = {
+                "asset_name": asset_name,
+                "category": category,
+                "region": region,
+                "weight": int(allocation) if allocation.isdigit() else 0,
+                "horizon": horizon,
+                "recommendation": recommendation,
+                "rationale": rationale
+            }
+            assets.append(asset)
+            
+            # Update category allocations
+            if category not in category_allocations:
+                category_allocations[category] = 0
+            category_allocations[category] += int(allocation) if allocation.isdigit() else 0
+            
+            # Update region allocations
+            if region not in region_allocations:
+                region_allocations[region] = 0
+            region_allocations[region] += int(allocation) if allocation.isdigit() else 0
+            
+            # Update recommendation allocations
+            if recommendation not in recommendation_allocations:
+                recommendation_allocations[recommendation] = 0
+            recommendation_allocations[recommendation] += int(allocation) if allocation.isdigit() else 0
+        
+        # Set the assets in the JSON
+        portfolio_json["data"]["assets"] = assets
+        portfolio_json["data"]["summary"]["by_category"] = category_allocations
+        portfolio_json["data"]["summary"]["by_region"] = region_allocations
+        portfolio_json["data"]["summary"]["by_recommendation"] = recommendation_allocations
+        
+        return portfolio_json
+    except Exception as e:
+        log_error(f"Error extracting portfolio data from sections: {e}")
+        return {
+            "status": "error",
+            "data": {
+                "report_date": current_date,
+                "assets": [],
+                "error": str(e)
+            }
+        }
+    
 async def generate_portfolio_json(client, assets_list, current_date, search_client=None, search_results=None):
     """Generate the structured JSON portfolio data."""
     system_prompt = """You are a data structuring assistant for Orasis Capital. 
@@ -286,8 +497,9 @@ async def generate_investment_portfolio():
             print("Exiting script. Please set your PERPLEXITY_API_KEY and try again.")
             sys.exit(1)
     
-    # Use a fixed date in 2025 as the current date
-    current_date = "April 4, 2025"
+    # Use the current date instead of a fixed date
+    from datetime import datetime
+    current_date = datetime.now().strftime("%B %d, %Y")
     
     # Start time for tracking runtime
     start_time = time.time()
@@ -298,51 +510,39 @@ async def generate_investment_portfolio():
         try:
             log_info("Performing web searches for market data upfront...")
             
-            # List of search queries covering different aspects of the portfolio
-            # Expanded to at least 30 searches for more comprehensive data
+            # List of search queries focusing on financial news sources and market data
+            # Limited to 20 queries for efficiency
+            current_month_year = datetime.now().strftime("%B %Y")
             search_queries = [
-                # Global Economy & Trade (7 queries)
-                "current global trade metrics and trends 2025",
-                "global GDP growth forecast by region 2025",
-                "international trade volumes by commodity 2025",
-                "emerging markets economic outlook 2025",
-                "global inflation rates and impact on trade 2025",
-                "China trade policy and import/export volumes 2025",
-                "supply chain disruptions and logistics trends 2025",
+                # Global Economy & Finance (4 queries)
+                f"Bloomberg financial market analysis global economy {current_month_year}",
+                f"Financial Times GDP growth forecasts by region {current_month_year}",
+                f"Wall Street Journal global investment outlook {current_month_year}",
+                f"Reuters market intelligence financial trends {current_month_year}",
                 
-                # Shipping Sector - Detailed (10 queries)
-                "container shipping rates and market trends 2025",
-                "Baltic Dry Index latest values and forecasts 2025",
-                "tanker shipping market rates and vessel utilization 2025",
-                "VLCC spot rates and time charter rates 2025",
-                "cape size vessel earnings and fleet growth 2025",
-                "panamax and supramax market trends 2025",
-                "LNG carrier market rates and orderbook 2025",
-                "port congestion data and container throughput 2025",
-                "shipping industry regulatory changes impact 2025",
-                "IMO 2023 and emission regulations shipping impact 2025",
+                # Shipping & Transportation Finance (4 queries)
+                f"Bloomberg shipping stock analysis maritime industry {current_month_year}",
+                f"Financial Times Baltic Dry Index forecast {current_month_year}",
+                f"MarineLink tanker market analysis rates {current_month_year}",
+                f"Bloomberg container shipping industry financials {current_month_year}",
                 
-                # Energy Markets (6 queries)
-                "crude oil price forecasts and inventory levels 2025",
-                "natural gas market supply demand balance 2025",
-                "LNG market growth and trade flows 2025",
-                "renewable energy investment trends 2025",
-                "energy transition impact on shipping 2025",
-                "bunker fuel prices and trends 2025",
+                # Energy Markets (4 queries)
+                f"Bloomberg energy commodities market analysis {current_month_year}",
+                f"Reuters oil price forecast investment {current_month_year}",
+                f"S&P Global natural gas market report {current_month_year}",
+                f"Financial Times LNG market investment outlook {current_month_year}",
                 
-                # Commodities (6 queries)
-                "iron ore market prices and production data 2025",
-                "copper supply demand balance and price forecasts 2025",
-                "aluminum market trends and inventory levels 2025",
-                "agricultural commodities trade flows 2025",
-                "grain production forecasts and shipping demand 2025",
-                "commodity futures market positioning 2025",
+                # Commodities & Investment (4 queries)
+                f"Bloomberg commodities market analysis metals {current_month_year}",
+                f"Reuters agricultural commodities investment {current_month_year}",
+                f"Barron's commodity ETF performance {current_month_year}",
+                f"Wall Street Journal metals market investment {current_month_year}",
                 
-                # Financial Markets (4 queries)
-                "shipping company stock performance 2025",
-                "global interest rates and bond market 2025",
-                "currency exchange rates impact on shipping 2025",
-                "shipping industry financing and debt levels 2025"
+                # Financial Markets & Investment (4 queries)
+                f"Bloomberg investment portfolio strategy {current_month_year}",
+                f"Morningstar ETF analysis sector performance {current_month_year}",
+                f"Financial Times interest rates investment impact {current_month_year}",
+                f"Wall Street Journal currency market investment strategy {current_month_year}"
             ]
             
             log_info(f"Executing {len(search_queries)} web searches...")
@@ -412,11 +612,43 @@ async def generate_investment_portfolio():
     base_system_prompt = """You are a professional investment analyst at Orasis Capital, a hedge fund specializing in global macro and trade-related assets.
 Your task is to create detailed investment portfolio analysis with data-backed research and specific source citations.
 
+IMPORTANT CLIENT CONTEXT - GEORGE (HEDGE FUND OWNER):
+George, the owner of Orasis Capital, has specified the following investment preferences:
+
+1. Risk Tolerance: Both high-risk opportunities and balanced investments with a mix of defensive and growth-oriented positions.
+
+2. Time Horizon Distribution:
+   - 30% of portfolio: 1 month to 1 quarter (short-term)
+   - 30% of portfolio: 1 quarter to 6 months (medium-term)
+   - 30% of portfolio: 6 months to 1 year (medium-long term)
+   - 10% of portfolio: 2 to 3 year trades (long-term)
+
+3. Investment Strategy: Incorporate both leverage and hedging strategies, not purely cash-based.
+
+4. Regional Focus: US, Europe, and Asia, with specific attention to global trade shifts affecting China, Asia, Middle East, and Africa.
+
+5. Commodity Interests: Wide range including crude oil futures, natural gas, metals, agricultural commodities, and related companies.
+
+6. Shipping Focus: Strong emphasis on various shipping segments including tanker, dry bulk, container, LNG, LPG, and offshore sectors.
+
+7. Credit Exposure: Include G7 10-year government bonds, high-yield shipping bonds, and corporate bonds of commodities companies.
+
+8. ETF & Indices: Include major global indices (Dow Jones, S&P 500, NASDAQ, European indices, Asian indices) and other tradeable ETFs.
+
+INVESTMENT THESIS:
+Orasis Capital's core strategy is to capitalize on global trade opportunities, with a 20-year track record in shipping-related investments. The fund identifies shifts in global trade relationships that impact countries and industries, analyzing whether these impacts are manageable. Key focuses include monitoring changes in trade policies from new governments, geopolitical developments, and structural shifts in global trade patterns.
+
+The firm believes trade flows are changing, with China, Asia, the Middle East, and Africa gaining more investment and trade volume compared to traditional areas like the US and Europe. Their research approach uses shipping (90% of global trade volume) as a leading indicator for macro investments, allowing them to identify shifts before they become widely apparent.
+
 IMPORTANT CONSTRAINTS:
 1. The ENTIRE report must be NO MORE than 13,000 words total. Optimize your content accordingly.
 2. You MUST include a comprehensive summary table in the Executive Summary section.
 3. Ensure all assertions are backed by specific data points or sources.
 4. Use current data from 2024-2025 where available."""
+    
+    # Initialize section tracking variables
+    total_sections = 10  # Total number of sections in the report
+    current_section = 1  # Initialize the current section counter
 
     # Dictionary to store all sections
     sections = {}
@@ -429,7 +661,7 @@ Include current date ({current_date}) and the title format specified previously.
 Summarize the key findings, market outlook, and high-level portfolio strategy.
 Keep it clear, concise, and data-driven with specific metrics.
 
-CRITICAL REQUIREMENT: You MUST include a comprehensive summary table displaying ALL portfolio positions (strictly limited to 10-15 total positions).
+CRITICAL REQUIREMENT: You MUST include a comprehensive summary table displaying ALL portfolio positions (strictly limited to 20-25 total positions).
 This table MUST be properly formatted in markdown and include columns for:
 - Asset/Ticker
 - Position Type (Long/Short)
@@ -501,6 +733,7 @@ NOTE: Keep this section concise to ensure the entire report remains under the 13
     # 4. Generate Commodities section
     current_section += 1
     log_info(f"Generating section {current_section}/{total_sections}: Commodities")
+    
     commodities_prompt = """Write a concise but informative analysis (500-600 words) of Commodities Markets as part of a macroeconomic outlook section.
 Include:
 - Metals: supply/demand fundamentals for copper, iron ore, aluminum with production figures and inventory levels
@@ -554,15 +787,18 @@ NOTE: Keep this section concise to ensure the entire report remains under the 13
     # 6. Generate Portfolio Recommendations for 12 assets
     current_section += 1
     log_info(f"Generating section {current_section}/{total_sections}: Portfolio Recommendations")
-    # First, generate a list of 12 diverse assets across asset classes
-    asset_prompt = """Create a list of 12 diverse investment assets that would be suitable for a trade-focused multi-asset portfolio.
-Include a mix of:
-- Shipping equities (tankers, dry bulk, containers, LNG)
-- Energy equities and ETFs
-- Commodity producers and ETFs
-- Bonds and credit instruments
-- Agricultural assets
+    # First, generate a list of 20-25 diverse assets across asset classes
+    asset_prompt = """Create a list of 20-25 diverse investment assets that would be suitable for a trade-focused multi-asset portfolio.
+Include a well-balanced mix of:
+- Shipping equities (tankers, dry bulk, containers, LNG carriers, port operators)
+- Energy equities and ETFs (oil, natural gas, LNG, renewable)
+- Commodity producers and ETFs (metals, agricultural, industrial)
+- Bonds and credit instruments (corporate, sovereign, treasury)
+- Agricultural assets and related companies
 - Infrastructure assets related to global trade
+- Logistics and supply chain companies
+- Financial services related to trade finance
+- Currency and forex instruments
 
 For each asset, provide:
 1. Full name with ticker
@@ -696,7 +932,7 @@ Every assertion should be backed by data or a referenced source.
     log_info("Generating portfolio items section...")
     portfolio_prompt = """Generate the detailed portfolio positions section of the report.
 
-STRICTLY LIMIT to exactly 10-15 investment positions TOTAL (mix of long/short) with detailed rationale for each.
+STRICTLY LIMIT to exactly 20-25 investment positions TOTAL (mix of long/short) with detailed rationale for each.
 These must be EXACTLY THE SAME positions as shown in the Executive Summary table.
 Use specific asset names/tickers and ensure target allocation percentages add to exactly 100%.
 
@@ -710,7 +946,8 @@ For each position provide:
 - Clear relation to the current market conditions
 
 Organize by asset category and provide a clear explanation of how each aligns with the overall strategy.
-Do not add any positions beyond the 10-15 shown in the Executive Summary table.
+Ensure comprehensive diversification across different market sectors, particularly focusing on finance-related assets.
+Do not add any positions beyond the 20-25 shown in the Executive Summary table.
 """
     sections["portfolio_items"] = await generate_section(
         client, "Portfolio Positions", base_system_prompt, portfolio_prompt, search_results=formatted_search_results
@@ -778,26 +1015,29 @@ Group references by category.
     # We've already done the web searches at the beginning
     # No need to repeat them here
     
-    # Generate Portfolio JSON
-    log_info("Generating structured portfolio JSON data...")
-    portfolio_data = await generate_portfolio_json(
-        client, 
-        [], 
-        current_date,
-        search_client=search_client,
-        search_results=formatted_search_results if formatted_search_results else None
-    )
+    # Extract portfolio data from the generated sections
+    log_info("Extracting portfolio data from generated report sections...")
+    portfolio_json = await extract_portfolio_data_from_sections(sections, current_date)
     
     # Log a reminder about the position limits
     log_info("Validating portfolio positions count...")
-    if "data" in portfolio_data and "assets" in portfolio_data["data"]:
-        assets_count = len(portfolio_data["data"]["assets"])
-        if assets_count < 10:
-            log_warning(f"Portfolio contains only {assets_count} positions, fewer than the 10-15 required.")
-        elif assets_count > 15:
-            log_warning(f"Portfolio contains {assets_count} positions, exceeding the 10-15 limit specified in the prompt.")
-        else:
-            log_success(f"Portfolio contains {assets_count} positions, within the 10-15 range as specified.")
+    # Check the extracted portfolio data
+    if "data" in portfolio_json and "assets" in portfolio_json["data"]:
+        assets_count = len(portfolio_json["data"]["assets"])
+        if assets_count < 20:
+            log_warning(f"Portfolio contains only {assets_count} positions, fewer than the 20-25 required.")
+        elif assets_count > 25:
+            log_warning(f"Portfolio contains {assets_count} positions, more than the 20-25 required.")
+    else:
+        log_error("Failed to extract portfolio data properly.")
+        
+    # Convert to JSON string for storage
+    portfolio_data = json.dumps(portfolio_json, indent=2)
+    
+    # Save all prompts to a text file for reference
+    save_prompts_to_file(current_date, base_system_prompt, exec_summary_prompt, global_economy_prompt,
+                        energy_markets_prompt, commodities_prompt, shipping_prompt, asset_prompt,
+                        portfolio_prompt, conclusion_prompt, references_prompt, search_queries)
     
     # Add web search info as a message if available to the JSON generation
     if formatted_search_results and len(formatted_search_results) > 0:
@@ -867,35 +1107,49 @@ Group references by category.
     print(f"Portfolio data saved to: {portfolio_file}")
     
     # Display asset allocation summary
-    if portfolio_data.get("status") == "success" and "data" in portfolio_data:
-        assets = portfolio_data["data"].get("assets", [])
+    if isinstance(portfolio_json, dict) and portfolio_json.get("status") == "success" and "data" in portfolio_json:
+        assets = portfolio_json["data"].get("assets", [])
         print(f"\nPortfolio contains {len(assets)} assets:")
         
         for asset in assets[:5]:  # Show first 5 assets
-            print(f"  {asset['asset_name']}: {asset['weight']}% - {asset['recommendation']}")
+            print(f"  {asset.get('asset_name', 'Unknown')}: {asset.get('weight', '0')}% - {asset.get('recommendation', 'No recommendation')}")
         
         if len(assets) > 5:
             print(f"  ... and {len(assets) - 5} more assets")
         
-        # Show category summary
-        if "summary" in portfolio_data["data"] and "by_category" in portfolio_data["data"]["summary"]:
+        # Show allocation by category
+        if "summary" in portfolio_json["data"] and "by_category" in portfolio_json["data"]["summary"]:
+            categories = portfolio_json["data"]["summary"]["by_category"]
             print("\nAllocation by category:")
-            for category, weight in portfolio_data["data"]["summary"]["by_category"].items():
+            for category, weight in categories.items():
                 print(f"  {category}: {weight}%")
         
-        # Show references count
-        references = portfolio_data["data"].get("references", [])
-        if references:
-            print(f"\nReport includes {len(references)} source references")
-            # Show sample of reference categories
-            categories = {}
-            for ref in references:
-                cat = ref.get("category", "Uncategorized")
-                categories[cat] = categories.get(cat, 0) + 1
-            
-            print("Reference categories:")
-            for cat, count in categories.items():
-                print(f"  {cat}: {count} sources")
+        # Show allocation by region
+        if "summary" in portfolio_json["data"] and "by_region" in portfolio_json["data"]["summary"]:
+            regions = portfolio_json["data"]["summary"]["by_region"]
+            print("\nAllocation by region:")
+            for region, weight in regions.items():
+                print(f"  {region}: {weight}%")
+        
+        # Show allocation by recommendation
+        if "summary" in portfolio_json["data"] and "by_recommendation" in portfolio_json["data"]["summary"]:
+            recommendations = portfolio_json["data"]["summary"]["by_recommendation"]
+            print("\nAllocation by recommendation:")
+            for recommendation, weight in recommendations.items():
+                print(f"  {recommendation}: {weight}%")
+        
+        # Count the number of unique categories
+        category_count = {}
+        for asset in assets:
+            cat = asset.get("category", "Uncategorized")
+            if cat not in category_count:
+                category_count[cat] = 0
+            category_count[cat] += 1
+        
+        print("\nPosition count by category:")
+        for category, count in category_count.items():
+            if category:
+                print(f"  {category}: {count} positions")
     
     return {
         "report": report_content,
@@ -905,4 +1159,3 @@ Group references by category.
 
 if __name__ == "__main__":
     asyncio.run(generate_investment_portfolio())
-    
